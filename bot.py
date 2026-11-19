@@ -38,6 +38,7 @@ from telegram.ext import (
     filters,
 )
 
+import ehi
 import rse5
 
 # --------------------------------------------------------------------------- #
@@ -148,8 +149,8 @@ WELCOME_TEXT = (
     "Hello <b>{name}</b> 👋\n\n"
     "🧰 <b>Available services</b> — pick one below 👇\n\n"
     "🚇 <b>Reese Tunnel</b> — unlock .RT config files\n"
-    "🌑 <b>Dark Tunnel</b> — coming soon\n"
-    "💉 <b>HTTP Injector</b> — coming soon\n\n"
+    "💉 <b>HTTP Injector</b> — unlock .ehi config files\n"
+    "🌑 <b>Dark Tunnel</b> — coming soon\n\n"
     "⚡ Fast • Secure • Trusted\n"
     "👇 <i>Use the buttons below</i>"
 )
@@ -177,6 +178,18 @@ REESE_TEXT = (
     "2️⃣ I will ask for the file <b>password</b> (if it has one)\n"
     "3️⃣ I unlock it and show you the full config 🔓\n\n"
     "⚠️ <i>Device-locked files also need the HWID they were made for.</i>"
+)
+
+HTTP_TEXT = (
+    "💉 <b>HTTP INJECTOR — FILE UNLOCKER</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "📤 <b>Send me your <code>.ehi</code> file now.</b>\n\n"
+    "How it works:\n"
+    "1️⃣ Attach the <code>.ehi</code> file here (as a document 📎)\n"
+    "2️⃣ I decrypt it <b>instantly — no password needed</b> ⚡\n"
+    "3️⃣ You get the full config + JSON file 🔓\n\n"
+    "✅ Supports HTTP Injector v5/v6 encrypted configs\n"
+    "🔒 <i>Locked files show lock/expiry info automatically.</i>"
 )
 
 SOON_TEXT = (
@@ -214,6 +227,10 @@ HELP_TEXT = (
     "   2. Send your <code>.RT</code> file 📎\n"
     "   3. Reply with the file password 🔑\n"
     "   4. Get the unlocked config 🔓\n\n"
+    "💉 <b>HTTP Injector</b>\n"
+    "   1. Tap 💉 HTTP Injector\n"
+    "   2. Send your <code>.ehi</code> file 📎\n"
+    "   3. Decrypted instantly — no password needed ⚡\n\n"
     "📜 <b>Commands</b>\n"
     "/menu — main menu\n"
     "/help — this guide\n"
@@ -434,10 +451,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
-    elif data in ("svc_dark", "svc_http"):
-        name = "🌑 Dark Tunnel" if data == "svc_dark" else "💉 HTTP Injector"
+    elif data == "svc_http":
+        set_stage(chat_id, "await_file")
         await query.edit_message_text(
-            SOON_TEXT.format(svc=name), reply_markup=SOON_KB, parse_mode=ParseMode.HTML
+            HTTP_TEXT,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "svc_dark":
+        await query.edit_message_text(
+            SOON_TEXT.format(svc="🌑 Dark Tunnel"),
+            reply_markup=SOON_KB,
+            parse_mode=ParseMode.HTML,
         )
 
     elif data == "about":
@@ -542,7 +570,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st.get("stage") != "await_file":
         await update.effective_message.reply_text(
             "🤖 To unlock a config file, open the menu and tap "
-            "<b>🚇 Reese Tunnel</b> first 👇",
+            "<b>🚇 Reese Tunnel</b> or <b>💉 HTTP Injector</b> first 👇",
             reply_markup=MENU_KB,
             parse_mode=ParseMode.HTML,
         )
@@ -561,6 +589,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("⚠️ Could not download the file. Try again.")
         return
 
+    # auto-detect the format: HTTP Injector (.ehi) or Reese Tunnel (.RT)
+    try:
+        ehi.parse_header(data)
+        return await run_decrypt_ehi(update, context, data)
+    except ValueError:
+        pass
+
     try:
         flags, salt, nonce, ct, tag = rse5.parse_header(data)
     except ValueError as e:
@@ -568,9 +603,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATS["fail"] += 1
         _save_stats(STATS)
         await update.effective_message.reply_text(
-            f"❌ <b>Not a valid Reese Tunnel file.</b>\n"
-            f"<code>{html.escape(str(e))}</code>\n\n"
-            "Send a proper <code>.RT</code> file 📎 or tap ⬅️ Menu.",
+            f"❌ <b>Not a valid config file.</b>\n\n"
+            f"I unlock <code>.RT</code> (Reese Tunnel) 🚇 and <code>.ehi</code> "
+            f"(HTTP Injector) 💉 files — send one of those 📎\n\n"
+            f"<code>{html.escape(str(e))}</code>",
             reply_markup=MENU_KB,
             parse_mode=ParseMode.HTML,
         )
@@ -953,6 +989,195 @@ async def run_decrypt(update: Update, context: ContextTypes.DEFAULT_TYPE,
         document=payload,
         filename=f"{fname}.json",
         caption="📄 <b>Full decrypted config</b> — keep it private 🔒",
+        parse_mode=ParseMode.HTML,
+    )
+    await update.effective_message.reply_text(
+        "✅ <b>Done!</b> Unlock another? 👇",
+        reply_markup=MENU_KB,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# HTTP Injector (.ehi) flow                                                   #
+# --------------------------------------------------------------------------- #
+def _summarize_ehi(res: dict) -> str:
+    """Premium unlock card for .ehi configs — same layout as the .RT card:
+    Host server -> Port -> Username -> Password -> Payload -> Proxy -> SNI
+    -> more settings, then the JSON file is sent LAST."""
+    n = res["normalized"]
+    header = res["header"]
+    NA = "—"
+
+    def val(key, cap=480):
+        v = n.get(key) or ""
+        if not v:
+            return NA
+        s = str(v)
+        if len(s) > cap:
+            s = s[:cap] + f"… (+{len(s) - cap} chars — full in JSON file)"
+        return html.escape(s)
+
+    lines = [
+        "╔═══════════════════════════════╗",
+        "║  💉 <b>EHI UNLOCKED — PREMIUM</b>  ║",
+        "╚═══════════════════════════════╝",
+        "",
+    ]
+    if n.get("configMessage"):
+        lines.append(f"📝 <b>Note:</b> {html.escape(str(n['configMessage'])[:120])}")
+    app_ver = header.get("app_version")
+    if app_ver:
+        lines.append(f"⚙️ Made with HTTP Injector <code>{html.escape(str(app_ver))}</code>")
+    lines.append(f"🧬 Scheme: <code>{html.escape(str(res['scheme']))}</code>")
+    lines.append("")
+
+    # ---- main settings, same order as the .RT card ----
+    lines += [
+        "🌐 <b>HOST SERVER</b>",
+        f"<code>{val('sshServer')}</code>",
+        "",
+        "🔌 <b>PORT</b>",
+        f"<code>{val('sshPort')}</code>",
+        "",
+        "👤 <b>USERNAME</b>",
+        f"<code>{val('sshUser')}</code>",
+        "",
+        "🔑 <b>PASSWORD</b>",
+        f"<code>{val('sshPassword')}</code>",
+        "",
+        "📦 <b>PAYLOAD</b>",
+        f"<code>{val('payload')}</code>",
+        "",
+        "🛡 <b>PROXY</b>",
+    ]
+    proxy = val("remoteProxy")
+    if proxy == NA:
+        proxy = val("proxyURL")
+    if proxy != NA and n.get("remoteProxyPort") and ":" not in str(n.get("remoteProxy") or ""):
+        proxy = f"{proxy}:{html.escape(str(n['remoteProxyPort']))}"
+    lines.append(f"<code>{proxy}</code>")
+    lines += [
+        "",
+        "🎯 <b>SNI</b>",
+        f"<code>{val('sniHostname')}</code>",
+    ]
+
+    # ---- "and more" ----
+    lines += ["", "━━━━━━ ⚙️ <b>MORE SETTINGS</b> ━━━━━━"]
+    more = []
+    if n.get("connectionType"):
+        more.append(f"🧭 Connection · <code>{html.escape(str(n['connectionType']))}</code>")
+    if n.get("ssl"):
+        more.append("🔐 SSL/TLS enabled")
+    dns = " → ".join(str(d) for d in (n.get("customDns1"), n.get("customDns2")) if d)
+    if dns:
+        more.append(f"🧬 DNS · <code>{html.escape(dns)}</code>")
+    v2r = n.get("v2ray")
+    if isinstance(v2r, dict) and v2r:
+        addr = v2r.get("address") or v2r.get("add") or NA
+        port = v2r.get("port") or NA
+        more.append(f"🛰 V2Ray · <code>{html.escape(str(addr))}:{html.escape(str(port))}</code>")
+    if isinstance(n.get("overwriteServerData"), dict) and n["overwriteServerData"]:
+        osd = n["overwriteServerData"]
+        more.append(f"🌐 Server override · <code>{html.escape(str(osd.get('sshServer') or osd.get('host') or 'present'))}</code>")
+    lines += more if more else [NA]
+
+    # ---- security / licence ----
+    lines += ["", "🛠 <b>SECURITY &amp; LICENCE</b>"]
+    locks = []
+    raw_locks = n.get("lockModes") or ""
+    if raw_locks:
+        try:
+            parsed = json.loads(raw_locks)
+            locks = [str(x) for x in parsed] if isinstance(parsed, list) else [raw_locks]
+        except (json.JSONDecodeError, TypeError):
+            locks = [raw_locks]
+    if locks and locks != ["none"]:
+        lines.append(f"🔒 Locks · {html.escape(', '.join(locks))}")
+    else:
+        lines.append("🔓 Locks · none")
+    hw = n.get("configHwid")
+    lines.append(
+        f"📱 HWID · <code>{html.escape(str(hw))}</code>"
+        if hw else "📱 HWID · not locked"
+    )
+    op = n.get("configLockMobileOperatorId")
+    if op:
+        lines.append(f"📶 Operator lock · <code>{html.escape(str(op))}</code>")
+    exp = n.get("configExpiryTimestamp")
+    if isinstance(exp, (int, float)) and exp > 0:
+        try:
+            lines.append(f"⏳ Expiry · {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp / 1000))}")
+        except (OSError, OverflowError, ValueError):
+            lines.append(f"⏳ Expiry · {html.escape(str(exp))}")
+    else:
+        lines.append("⏳ Expiry · ♾ no expiry (unlimited)")
+
+    lines += [
+        "",
+        "📄 <b>Full JSON config</b> is attached below 👇",
+        "╭──────────────────────────────╮",
+        "⚡ <b>YOBBY TECH — THE KING OF TECH</b> 👑",
+        "╰──────────────────────────────╯",
+    ]
+    return "\n".join(lines)
+
+
+async def run_decrypt_ehi(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          data: bytes):
+    """HTTP Injector files need no password — decrypt instantly."""
+    chat_id = update.effective_chat.id
+    clear_stage(chat_id)
+    notice = await update.effective_message.reply_text(PROCESSING_TEXT, parse_mode=ParseMode.HTML)
+
+    try:
+        res = await asyncio.to_thread(ehi.decrypt, data)
+    except ValueError as e:
+        STATS["fail"] += 1
+        _save_stats(STATS)
+        await notice.edit_text(
+            "❌ <b>EHI UNLOCK FAILED</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"<code>{html.escape(str(e))}</code>\n\n"
+            "This may be an unsupported HTTP Injector variant — contact the admin 👇",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔁 Try Again", callback_data="svc_http")],
+                    [InlineKeyboardButton("📞 Contact Admin", url=WA_LINK)],
+                    [InlineKeyboardButton("⬅️ Menu", callback_data="back_menu")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception:
+        STATS["fail"] += 1
+        _save_stats(STATS)
+        log.exception("ehi decrypt error")
+        await notice.edit_text(
+            "❌ <b>Unexpected error.</b> Please contact the admin.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📞 Contact Admin", url=WA_LINK)]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    STATS["ok"] += 1
+    _save_stats(STATS)
+
+    await notice.edit_text(_summarize_ehi(res), parse_mode=ParseMode.HTML)
+
+    # send the full JSON as a file
+    payload = res["json"].encode("utf-8")
+    name = (res["normalized"].get("sniHostname")
+            or res["normalized"].get("connectionType") or "ehi-config")
+    fname = "".join(ch for ch in str(name)[:40] if ch.isalnum() or ch in "-_ ").strip() or "ehi-config"
+    await update.effective_message.reply_document(
+        document=payload,
+        filename=f"{fname}.json",
+        caption="📄 <b>Full decrypted .ehi config</b> — keep it private 🔒",
         parse_mode=ParseMode.HTML,
     )
     await update.effective_message.reply_text(
