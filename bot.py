@@ -751,33 +751,101 @@ def _fmt_bool(v):
 
 
 def _summarize(envelope: dict) -> str:
-    """Human summary using the REAL Reese Tunnel envelope schema (verified on
-    production files): meta.{name,author,createdAt,expiresAt,locked,lockAll,
-    hwid,...} + config.{profileName,sshHost,sshPort,username,payload,sni,...}."""
+    """Premium unlock card, arranged exactly:
+    Host server -> Port -> Username -> Password -> Payload -> Proxy -> SNI
+    -> more settings, then the JSON file is sent LAST.
+    Uses the REAL Reese Tunnel envelope schema (verified on production files):
+    meta.{name,author,createdAt,expiresAt,locked,lockAll,hwid,...} +
+    config.{profileName,sshHost,sshPort,username,password,payload,sni,...}."""
     meta = envelope.get("meta") if isinstance(envelope, dict) else {}
     cfg = envelope.get("config") if isinstance(envelope, dict) else {}
     meta = meta if isinstance(meta, dict) else {}
     cfg = cfg if isinstance(cfg, dict) else {}
-    lines = ["🔓 <b>FILE UNLOCKED SUCCESSFULLY!</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    NA = "—"
+
+    def val(key, cap=480):
+        v = cfg.get(key)
+        if v in (None, "", False):
+            return NA
+        s = str(v)
+        if len(s) > cap:
+            s = s[:cap] + f"… (+{len(s) - cap} chars — full in JSON file)"
+        return html.escape(s)
+
+    lines = [
+        "╔═══════════════════════════════╗",
+        "║   🔓 <b>CONFIG UNLOCKED — PREMIUM</b>   ║",
+        "╚═══════════════════════════════╝",
+        "",
+    ]
 
     name = meta.get("name") or cfg.get("profileName")
     if name:
-        lines.append(f"📛 <b>Name:</b> {html.escape(str(name))}")
+        lines.append(f"📛 <b>{html.escape(str(name)[:60])}</b>")
     author = meta.get("author")
     if author:
-        lines.append(f"👤 <b>Author:</b> {html.escape(str(author))}")
-    created = meta.get("createdAt")
-    if isinstance(created, (int, float)) and created > 0:
-        try:
-            lines.append(f"🗓 Created: {time.strftime('%Y-%m-%d', time.localtime(created / 1000))}")
-        except (OSError, OverflowError, ValueError):
-            pass
-    exp = meta.get("expiresAt")
-    if isinstance(exp, (int, float)) and exp > 0:
-        try:
-            lines.append(f"⏳ <b>Expiry:</b> {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp / 1000))}")
-        except (OSError, OverflowError, ValueError):
-            pass
+        lines.append(f"👑 Author: {html.escape(str(author))}")
+    lines.append("")
+
+    # ---- main settings, in the exact order requested ----
+    lines += [
+        "🌐 <b>HOST SERVER</b>",
+        f"<code>{val('sshHost')}</code>",
+        "",
+        "🔌 <b>PORT</b>",
+        f"<code>{val('sshPort')}</code>",
+        "",
+        "👤 <b>USERNAME</b>",
+        f"<code>{val('username')}</code>",
+        "",
+        "🔑 <b>PASSWORD</b>",
+        f"<code>{val('password')}</code>",
+        "",
+        "📦 <b>PAYLOAD</b>",
+        f"<code>{val('payload')}</code>",
+        "",
+        "🛡 <b>PROXY</b>",
+    ]
+    if cfg.get("proxyHost") and cfg.get("proxyPort"):
+        lines.append(
+            f"<code>{html.escape(str(cfg['proxyHost']))}:{html.escape(str(cfg['proxyPort']))}</code>"
+        )
+    else:
+        lines.append(f"<code>{val('proxyHost') if cfg.get('proxyHost') else val('proxyPort')}</code>")
+    lines += [
+        "",
+        "🎯 <b>SNI</b>",
+        f"<code>{val('sni')}</code>",
+    ]
+
+    # ---- "and more" ----
+    lines += ["", "━━━━━━ ⚙️ <b>MORE SETTINGS</b> ━━━━━━"]
+    more = []
+    if cfg.get("tunnelMode"):
+        more.append(f"🧭 Tunnel mode · <code>{html.escape(str(cfg['tunnelMode']))}</code>")
+    if cfg.get("sshUdpGatewayPort"):
+        more.append(f"🚪 UDP gateway · <code>{html.escape(str(cfg['sshUdpGatewayPort']))}</code>")
+    dns = " → ".join(str(d) for d in (cfg.get("dnsPrimary"), cfg.get("dnsSecondary")) if d)
+    if dns:
+        more.append(f"🧬 DNS · <code>{html.escape(dns)}</code>")
+    if cfg.get("udpCustomHost"):
+        more.append(f"🔌 UDP host · <code>{html.escape(str(cfg['udpCustomHost']))}</code>")
+    for k, lbl in (
+        ("v2rayMode", "🛰 V2Ray mode"),
+        ("slowDns", "🐢 SlowDNS tunnel"),
+        ("udpCustom", "🔌 UDP custom mode"),
+        ("enhanced", "⚡ Enhanced mode"),
+        ("useSni", "🎯 SNI enabled"),
+        ("usePayload", "📦 Payload enabled"),
+        ("useRemoteProxy", "🛡 Remote proxy"),
+        ("autoReconnect", "🔄 Auto-reconnect"),
+    ):
+        if cfg.get(k):
+            more.append(lbl)
+    lines += more if more else [NA]
+
+    # ---- security / licence ----
+    lines += ["", "🛠 <b>SECURITY &amp; LICENCE</b>"]
     if meta.get("locked"):
         locks = []
         if meta.get("lockAll"):
@@ -790,36 +858,34 @@ def _summarize(envelope: dict) -> str:
             locks.append("proxy")
         if meta.get("blockRoot"):
             locks.append("root blocked")
-        if meta.get("hwid"):
-            locks.append(f"HWID {meta['hwid']}")
-        lines.append("🔒 Locks: " + html.escape(", ".join(locks) or "enabled"))
+        lines.append(f"🔒 Locks · {html.escape(', '.join(locks) or 'enabled')}")
+    hw = meta.get("hwid")
+    lines.append(
+        f"📱 HWID · <code>{html.escape(str(hw))}</code>"
+        if hw else "📱 HWID · not locked"
+    )
+    exp = meta.get("expiresAt")
+    if isinstance(exp, (int, float)) and exp > 0:
+        try:
+            lines.append(f"⏳ Expiry · {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp / 1000))}")
+        except (OSError, OverflowError, ValueError):
+            lines.append("⏳ Expiry · " + html.escape(str(exp)))
+    else:
+        lines.append("⏳ Expiry · ♾ no expiry (unlimited)")
+    created = meta.get("createdAt")
+    if isinstance(created, (int, float)) and created > 0:
+        try:
+            lines.append(f"🗓 Created · {time.strftime('%Y-%m-%d', time.localtime(created / 1000))}")
+        except (OSError, OverflowError, ValueError):
+            pass
 
-    for key, label in (
-        ("sshHost", "🌐 SSH host"), ("sshPort", "🔌 SSH port"),
-        ("username", "👤 SSH user"), ("proxyHost", "🛡 Proxy"),
-        ("proxyPort", "🛡 Proxy port"), ("payload", "📦 Payload"),
-        ("sni", "🎯 SNI"), ("tunnelMode", "🧭 Tunnel mode"),
-        ("sshUdpGatewayPort", "🚪 UDP gateway"), ("dnsPrimary", "🧭 DNS"),
-    ):
-        v = cfg.get(key)
-        if v in (None, "", False):
-            continue
-        s = html.escape(str(v))
-        if len(s) > 220:
-            s = s[:220] + "…"
-        lines.append(f"{label}: <code>{s}</code>")
-    flags_on = [lbl for key, lbl in (
-        ("v2rayMode", "🛰 V2Ray"), ("slowDns", "🐢 SlowDNS"),
-        ("udpCustom", "🔌 UDP custom"), ("enhanced", "⚡ Enhanced"),
-    ) if cfg.get(key)]
-    if flags_on:
-        lines.append(" · ".join(flags_on))
-    if cfg.get("udpCustomHost"):
-        lines.append(f"🔌 UDP host: <code>{html.escape(str(cfg['udpCustomHost']))}</code>")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("📄 Full config JSON is attached below 👇")
-    lines.append("⚡ <i>Decrypted by Yobby Tech — The King of Tech 👑</i>")
+    lines += [
+        "",
+        "📄 <b>Full JSON config</b> is attached below 👇",
+        "╭──────────────────────────────╮",
+        "⚡ <b>YOBBY TECH — THE KING OF TECH</b> 👑",
+        "╰──────────────────────────────╯",
+    ]
     return "\n".join(lines)
 
 
