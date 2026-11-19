@@ -52,6 +52,13 @@ ADMIN_IDS = {
 }
 MAX_FILE_BYTES = 20 * 1024 * 1024
 
+# Admin-only weak-password auto-recovery (see README: "Password recovery").
+# This is password RECOVERY for weak/forgotten passwords — not a bypass.
+# Strong passwords are cryptographically safe (0.8 s per guess, 2^256 keyspace).
+RECOVERY_WORDLIST_PATH = os.environ.get("RECOVERY_WORDLIST_PATH", "")
+RECOVERY_MAX_CANDIDATES = int(os.environ.get("RECOVERY_MAX_CANDIDATES", "150"))
+RECOVERY_TIME_BUDGET = float(os.environ.get("RECOVERY_TIME_BUDGET", "600"))
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s - %(message)s", level=logging.INFO
 )
@@ -456,6 +463,64 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
+    elif data == "recover_run":
+        st = stage_of(chat_id)
+        if update.effective_user.id not in ADMIN_IDS:
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        if st.get("stage") != "await_password" or not st.get("data"):
+            await query.answer("No pending file — send one first.", show_alert=True)
+            return
+        if st.get("recovering"):
+            await query.answer("Recovery is already running…", show_alert=True)
+            return
+        st["recovering"] = True
+        candidates = load_wordlist(st.get("fname", ""))
+        await query.edit_message_text(
+            f"🧠 <b>AUTO-RECOVERY RUNNING</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Testing <b>{len(candidates)}</b> candidate passwords…\n"
+            f"⏳ ~1-2 s per candidate — can take several minutes.\n\n"
+            f"🔓 <i>Recovers only weak/common passwords. "
+            f"Strong passwords cannot be bypassed.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        deadline = time.time() + RECOVERY_TIME_BUDGET
+        found, tried, elapsed = await asyncio.to_thread(
+            try_recover, st["data"], candidates, st.get("hwid", b""), deadline
+        )
+        st["recovering"] = False
+        if found:
+            await update.effective_message.reply_text(
+                f"🔓 <b>PASSWORD RECOVERED!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔑 Password: <code>{html.escape(found)}</code>\n"
+                f"✅ {tried} candidates tried in {elapsed:.0f} s\n\n"
+                f"Unlocking now…",
+                parse_mode=ParseMode.HTML,
+            )
+            await run_decrypt(update, context, st["data"], found.encode(),
+                              st.get("hwid", b""))
+        else:
+            set_stage(chat_id, "await_password", data=st["data"],
+                      hwid=st.get("hwid", b""), fname=st.get("fname", ""))
+            await update.effective_message.reply_text(
+                f"❌ <b>NO MATCH FOUND</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Tested {tried} candidates in {elapsed:.0f} s — the password is "
+                f"not weak enough to appear in the list.\n\n"
+                f"🔐 Strong passwords cannot be bypassed — ask the file owner "
+                f"or contact the admin 👇",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🔁 Try Again", callback_data="recover_run")],
+                        [InlineKeyboardButton("📞 Contact Admin", url=WA_LINK)],
+                        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
+                    ]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+
     elif data == "back_menu":
         user = update.effective_user
         clear_stage(chat_id)
@@ -532,13 +597,28 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
     elif flags & 2:
-        set_stage(chat_id, "await_password", data=data, hwid=b"")
-        await update.effective_message.reply_text(
-            "🔑 This file is <b>password-protected</b>.\n\n"
-            "Send the <b>password</b> now 👇",
-            reply_markup=ForceReply(selective=True),
-            parse_mode=ParseMode.HTML,
-        )
+        set_stage(chat_id, "await_password", data=data, hwid=b"", fname=doc.file_name or "")
+        if update.effective_user.id in ADMIN_IDS:
+            await update.effective_message.reply_text(
+                "🔑 This file is <b>password-protected</b>.\n\n"
+                "Send the <b>password</b> now 👇\n\n"
+                "🧠 <i>Admin tip:</i> or tap Auto-recovery to try common/weak passwords.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton(
+                            "🧠 Auto-recovery (admin)", callback_data="recover_run")],
+                        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
+                    ]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.effective_message.reply_text(
+                "🔑 This file is <b>password-protected</b>.\n\n"
+                "Send the <b>password</b> now 👇",
+                reply_markup=ForceReply(selective=True),
+                parse_mode=ParseMode.HTML,
+            )
     else:
         set_stage(chat_id, "await_password", data=data, hwid=b"")
         await run_decrypt(update, context, data, b"", b"")
@@ -580,6 +660,90 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------- #
+# Admin-only weak-password auto-recovery                                      #
+# --------------------------------------------------------------------------- #
+# Tries common passwords + PINs + filename-derived guesses, cheapest first.
+# ~0.8 s per candidate (600k HMAC chain) -> the full default list takes ~2 min.
+RECOVERY_PIN_GUESSES = [
+    "12345", "1234", "123456", "0000", "00000", "1111", "1212", "123123",
+    "112233", "654321", "000000", "2580", "1590",
+]
+
+DEFAULT_WORDLIST = [
+    "vip", "vip2", "vip123", "free", "free123", "fre3", "admin", "admin123",
+    "adm1n", "password", "password123", "passw0rd", "pass", "pass123",
+    "unlock", "unlocked", "config", "configs", "tunnel", "tunnels", "reese",
+    "reese123", "reesevpn", "dark", "darktunnel", "http", "httpinjector",
+    "injector", "ssh", "slowdns", "v2ray", "udp", "payload", "sni", "bughost",
+    "bug", "host", "proxy", "server", "data", "bundle", "bundles", "unlimited",
+    "hack", "crack", "premium", "trial", "test", "test123", "demo", "client",
+    "shared", "public", "locked", "key", "secret", "master", "root",
+    "2020", "2021", "2022", "2023", "2024", "2025", "2026",
+    "kenya", "nairobi", "kenyatech", "tech", "king", "kingoftech", "yobby",
+    "yobbytech", "yobby123", "fridah", "fridahtech", "fridah123", "telkom",
+    "telkomkenya", "faiba", "safaricom", "saf", "airtel", "equitel", "mtn",
+    "glo", "airteltigo", "vodacom", "vodafone", "jazz", "etisalat", "9mobile",
+    "mtnug", "vodacomtz", "orange", "wap", "netify", "netifyvpn", "starks",
+    "starkvpn", "anony", "anonytun", "turbo", "turbovpn", "super", "mega",
+    "magic", "speednet", "fastnet", "netfree", "internet", "chapa", "haraka",
+    "freemium", "freebies", "datafree", "offer", "promo", "bonus", "money",
+    "cash", "like", "share", "subscribe", "join", "channel", "welcome",
+]
+
+
+def filename_candidates(filename: str):
+    """Sellers often name the file after the password or ISP."""
+    if not filename:
+        return []
+    stem = filename.rsplit(".", 1)[0].strip()
+    if not stem:
+        return []
+    return [
+        stem, stem.lower(), stem.replace(" ", ""), stem.replace(" ", "").lower(),
+        stem.replace(" ", "_"), stem + "123", stem.replace(" ", "") + "123",
+        stem.replace(" ", "") + "2024",
+    ]
+
+
+def load_wordlist(filename: str = ""):
+    """Custom list (RECOVERY_WORDLIST_PATH) -> fallback default list, PINs +
+    filename-derived candidates first (highest hit probability)."""
+    words = []
+    if RECOVERY_WORDLIST_PATH:
+        try:
+            with open(RECOVERY_WORDLIST_PATH, "r", encoding="utf-8",
+                      errors="ignore") as f:
+                words = [ln.strip() for ln in f if ln.strip()]
+        except OSError:
+            log.warning("RECOVERY_WORDLIST_PATH unreadable: %s", RECOVERY_WORDLIST_PATH)
+    if not words:
+        words = DEFAULT_WORDLIST
+    candidates = RECOVERY_PIN_GUESSES + filename_candidates(filename) + words
+    seen, out = set(), []
+    for w in candidates:
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out[:RECOVERY_MAX_CANDIDATES]
+
+
+def try_recover(data: bytes, candidates, hwid: bytes = b"", deadline=None):
+    """Sequential dictionary attack. Returns (password|None, tried, seconds)."""
+    flags, salt, nonce, ct, tag = rse5.parse_header(data)
+    started = time.time()
+    tried = 0
+    for cand in candidates:
+        pw = cand.encode("utf-8", "ignore")
+        key = rse5.kdf(rse5.build_material(flags, hwid, pw), salt)
+        tried += 1
+        if rse5.compute_tag(key, nonce, data[:34], ct) == tag:
+            return cand, tried, time.time() - started
+        if deadline and time.time() > deadline:
+            break
+    return None, tried, time.time() - started
+
+
+# --------------------------------------------------------------------------- #
 # Decryption                                                                  #
 # --------------------------------------------------------------------------- #
 def _fmt_bool(v):
@@ -587,43 +751,71 @@ def _fmt_bool(v):
 
 
 def _summarize(envelope: dict) -> str:
-    """Best-effort human summary of the decrypted envelope."""
+    """Human summary using the REAL Reese Tunnel envelope schema (verified on
+    production files): meta.{name,author,createdAt,expiresAt,locked,lockAll,
+    hwid,...} + config.{profileName,sshHost,sshPort,username,payload,sni,...}."""
     meta = envelope.get("meta") if isinstance(envelope, dict) else {}
     cfg = envelope.get("config") if isinstance(envelope, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+    cfg = cfg if isinstance(cfg, dict) else {}
     lines = ["🔓 <b>FILE UNLOCKED SUCCESSFULLY!</b>", "━━━━━━━━━━━━━━━━━━━━"]
 
-    if isinstance(meta, dict):
-        name = meta.get("name") or meta.get("configName")
-        if name:
-            lines.append(f"📛 <b>Name:</b> {html.escape(str(name))}")
-        if meta.get("creator") or meta.get("creatorName"):
-            lines.append(f"👤 <b>Creator:</b> {html.escape(str(meta.get('creator') or meta.get('creatorName')))}")
-        exp = meta.get("expiry") or meta.get("expiryMillis")
-        if exp:
-            try:
-                exp_v = int(exp)
-                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp_v / 1000)) \
-                    if exp_v > 10**12 else time.strftime("%Y-%m-%d", time.localtime(exp_v))
-                lines.append(f"⏳ <b>Expiry:</b> {ts}")
-            except (TypeError, ValueError):
-                lines.append(f"⏳ <b>Expiry:</b> {html.escape(str(exp))}")
-        hw = meta.get("hwid") or meta.get("lockedHwid")
-        if hw:
-            lines.append(f"📱 <b>HWID lock:</b> <code>{html.escape(str(hw))}</code>")
+    name = meta.get("name") or cfg.get("profileName")
+    if name:
+        lines.append(f"📛 <b>Name:</b> {html.escape(str(name))}")
+    author = meta.get("author")
+    if author:
+        lines.append(f"👤 <b>Author:</b> {html.escape(str(author))}")
+    created = meta.get("createdAt")
+    if isinstance(created, (int, float)) and created > 0:
+        try:
+            lines.append(f"🗓 Created: {time.strftime('%Y-%m-%d', time.localtime(created / 1000))}")
+        except (OSError, OverflowError, ValueError):
+            pass
+    exp = meta.get("expiresAt")
+    if isinstance(exp, (int, float)) and exp > 0:
+        try:
+            lines.append(f"⏳ <b>Expiry:</b> {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp / 1000))}")
+        except (OSError, OverflowError, ValueError):
+            pass
+    if meta.get("locked"):
+        locks = []
+        if meta.get("lockAll"):
+            locks.append("all settings")
+        if meta.get("lockPayloadUnlockServer"):
+            locks.append("payload/server")
+        if meta.get("unlockUserPass"):
+            locks.append("user/pass")
+        if meta.get("lockRemoteProxy"):
+            locks.append("proxy")
+        if meta.get("blockRoot"):
+            locks.append("root blocked")
+        if meta.get("hwid"):
+            locks.append(f"HWID {meta['hwid']}")
+        lines.append("🔒 Locks: " + html.escape(", ".join(locks) or "enabled"))
 
-    if isinstance(cfg, dict):
-        for key, label in (
-            ("mode", "🧭 Mode"), ("protocol", "🧭 Protocol"), ("host", "🌐 Host"),
-            ("server", "🌐 Server"), ("port", "🔌 Port"), ("payload", "📦 Payload"),
-            ("sni", "🎯 SNI"), ("proxy", "🛡 Proxy"), ("username", "👤 User"),
-            ("uuid", "🆔 UUID"),
-        ):
-            v = cfg.get(key)
-            if v not in (None, ""):
-                s = html.escape(str(v))
-                if len(s) > 300:
-                    s = s[:300] + "…"
-                lines.append(f"{label}: <code>{s}</code>")
+    for key, label in (
+        ("sshHost", "🌐 SSH host"), ("sshPort", "🔌 SSH port"),
+        ("username", "👤 SSH user"), ("proxyHost", "🛡 Proxy"),
+        ("proxyPort", "🛡 Proxy port"), ("payload", "📦 Payload"),
+        ("sni", "🎯 SNI"), ("tunnelMode", "🧭 Tunnel mode"),
+        ("sshUdpGatewayPort", "🚪 UDP gateway"), ("dnsPrimary", "🧭 DNS"),
+    ):
+        v = cfg.get(key)
+        if v in (None, "", False):
+            continue
+        s = html.escape(str(v))
+        if len(s) > 220:
+            s = s[:220] + "…"
+        lines.append(f"{label}: <code>{s}</code>")
+    flags_on = [lbl for key, lbl in (
+        ("v2rayMode", "🛰 V2Ray"), ("slowDns", "🐢 SlowDNS"),
+        ("udpCustom", "🔌 UDP custom"), ("enhanced", "⚡ Enhanced"),
+    ) if cfg.get(key)]
+    if flags_on:
+        lines.append(" · ".join(flags_on))
+    if cfg.get("udpCustomHost"):
+        lines.append(f"🔌 UDP host: <code>{html.escape(str(cfg['udpCustomHost']))}</code>")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("📄 Full config JSON is attached below 👇")
