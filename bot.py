@@ -237,7 +237,8 @@ HELP_TEXT = (
     "/about — about Yobby Tech\n"
     "/contact — talk to the admin\n"
     "/cancel — cancel current action\n"
-    "/stats — bot statistics\n\n"
+    "/stats — bot statistics\n"
+    "/version — check which build is live\n\n"
     "⚠️ <b>Notes</b>\n"
     "• Device-locked (HWID) files need that device's HWID\n"
     "• Wrong password = decryption fails\n"
@@ -245,6 +246,19 @@ HELP_TEXT = (
 )
 
 PROCESSING_TEXT = "⏳ <b>Decrypting…</b> this takes a few seconds.\nPlease wait 🔒"
+
+# Bump this when features change — send /version to the live bot to check it.
+BOT_VERSION = "2.0.0-ehi"
+VERSION_TEXT = (
+    "🏷 <b>BOT VERSION</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    f"Version: <code>{BOT_VERSION}</code>\n\n"
+    "🚇 Reese Tunnel <code>.RT</code> — ✅ active\n"
+    "💉 HTTP Injector <code>.ehi</code> — ✅ active (instant, no password)\n"
+    "🌑 Dark Tunnel — 🚧 coming soon\n\n"
+    "<i>If this message shows 2.0.0-ehi, the live bot is the latest build.\n"
+    "If Telegram replies “unknown command”, the host is still running the old build — trigger a redeploy.</i>"
+)
 
 NOT_MEMBER_TEXT = (
     "⛔ <b>NOT VERIFIED YET</b>\n"
@@ -356,6 +370,10 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MENU_KB,
         parse_mode=ParseMode.HTML,
     )
+
+
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(VERSION_TEXT, parse_mode=ParseMode.HTML)
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1203,6 +1221,7 @@ def main():
     app.add_handler(CommandHandler("contact", cmd_contact))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("version", cmd_version))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
